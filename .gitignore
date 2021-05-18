@@ -1,33 +1,12 @@
-# Object files
-*.o
-*.ko
-*.obj
+
+*.bin
+
 *.elf
 
-# Precompiled Headers
-*.gch
-*.pch
+*.map
 
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
+.DS_Store
 
-# Shared objects (inc. Windows DLLs)
-*.dll
-*.so
-*.so.*
-*.dylib
+*.pyc
 
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
-
-# Debug files
-*.dSYM/
-*.su
+utils/web_converter/css_html_js_minify/__pycache__/

